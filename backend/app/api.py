@@ -31,6 +31,12 @@ from backend.app.doctor_import import (
     list_doctors,
     validate_doctors_json,
 )
+from backend.app.metrics_store import (
+    init_metrics_db,
+    record_http_metric,
+    record_workflow_metric,
+    get_metrics_summary,
+)
 
 
 # ============================================================
@@ -179,6 +185,7 @@ graph = build_graph()
 async def lifespan(app: FastAPI):
     """Initialize application resources on startup."""
     init_db()
+    init_metrics_db()
     log_event("application_started")
     try:
         yield
@@ -247,16 +254,32 @@ async def log_http_requests(
             2,
         )
 
+        outcome = "success" if status_code < 400 else "failure"
+        # Use the matched route template when available; avoid storing query
+        # strings or user-provided identifiers in persistent metrics.
+        route = request.scope.get("route")
+        route_path = getattr(route, "path", request.url.path)
+
         log_event(
             "http_request",
             method=request.method,
-            path=request.url.path,
+            path=route_path,
             status_code=status_code,
             duration_ms=duration_ms,
-            outcome=(
-                "success" if status_code < 400 else "failure"
-            ),
+            outcome=outcome,
         )
+
+        try:
+            record_http_metric(
+                method=request.method,
+                path=route_path,
+                status_code=status_code,
+                duration_ms=duration_ms,
+                outcome=outcome,
+            )
+        except Exception:
+            # Observability must never break a user-facing request.
+            logger.exception("Unable to persist HTTP observability metric")
 
 
 # ============================================================
@@ -392,6 +415,15 @@ async def schedule(request: SchedulingRequest):
             trace_node_count=len(trace),
             executed_nodes=executed_nodes,
         )
+        try:
+            record_workflow_metric(
+                workflow_status=status or "unknown",
+                outcome=outcome,
+                duration_ms=duration_ms,
+                trace_node_count=len(trace),
+            )
+        except Exception:
+            logger.exception("Unable to persist workflow observability metric")
 
         return SchedulingResponse(
             thread_id=request.thread_id,
@@ -413,6 +445,15 @@ async def schedule(request: SchedulingRequest):
             "scheduling_workflow_failed",
             duration_ms=duration_ms,
         )
+        try:
+            record_workflow_metric(
+                workflow_status="error",
+                outcome="failure",
+                duration_ms=duration_ms,
+                trace_node_count=0,
+            )
+        except Exception:
+            logger.exception("Unable to persist failed workflow metric")
         logger.exception("Scheduling workflow failed")
 
         raise HTTPException(
@@ -561,6 +602,23 @@ async def admin_session(admin=Depends(require_admin)):
         "authenticated": True,
         "username": admin.get("sub", "admin"),
     }
+
+
+# ============================================================
+# Admin: Observability Dashboard Data
+# ============================================================
+
+@app.get("/api/v1/admin/observability")
+async def admin_observability(admin=Depends(require_admin)):
+    """Return persisted request and scheduling workflow metrics."""
+    try:
+        return get_metrics_summary()
+    except Exception:
+        logger.exception("Unable to load observability metrics")
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to load observability metrics.",
+        ) from None
 
 
 # ============================================================
