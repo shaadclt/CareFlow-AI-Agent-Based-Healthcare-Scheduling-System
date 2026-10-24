@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 
 import {
   Activity,
+  BarChart3,
   Bot,
   CalendarDays,
   CheckCircle2,
@@ -106,6 +107,11 @@ function App() {
   const [doctors, setDoctors] = useState([]);
   const [directoryLoading, setDirectoryLoading] = useState(false);
   const [directoryError, setDirectoryError] = useState("");
+
+  // Persistent observability dashboard state.
+  const [observability, setObservability] = useState(null);
+  const [observabilityLoading, setObservabilityLoading] = useState(false);
+  const [observabilityError, setObservabilityError] = useState("");
 
   const adminRequestJson = (path, options = {}) => {
     const headers = new Headers(options.headers || {});
@@ -295,9 +301,27 @@ function App() {
     }
   };
 
+  const loadObservability = async () => {
+    setObservabilityLoading(true);
+    setObservabilityError("");
+    try {
+      const result = await adminRequestJson("/api/v1/admin/observability");
+      setObservability(result);
+    } catch (error) {
+      setObservabilityError(
+        error.message || "Could not load observability metrics."
+      );
+    } finally {
+      setObservabilityLoading(false);
+    }
+  };
+
   useEffect(() => {
     if (activeView === "admin" && adminToken) {
       loadDoctorDirectory();
+    }
+    if (activeView === "observability" && adminToken) {
+      loadObservability();
     }
   }, [activeView, adminToken]);
 
@@ -528,6 +552,17 @@ function App() {
           <Database size={17} />
           {adminToken ? "Doctor Management" : "Admin Login"}
         </button>
+
+        {adminToken && (
+          <button
+            type="button"
+            className={`view-tab ${activeView === "observability" ? "active" : ""}`}
+            onClick={() => setActiveView("observability")}
+          >
+            <BarChart3 size={17} />
+            Observability
+          </button>
+        )}
       </nav>
 
       {activeView === "chat" ? (
@@ -607,6 +642,14 @@ function App() {
             />
           </aside>
         </main>
+      ) : activeView === "observability" && adminToken ? (
+        <ObservabilityPage
+          data={observability}
+          loading={observabilityLoading}
+          error={observabilityError}
+          onRefresh={loadObservability}
+          onBack={() => setActiveView("admin")}
+        />
       ) : !adminToken ? (
         <main className="admin-login-page">
           <form className="admin-login-card" onSubmit={handleAdminLogin}>
@@ -884,6 +927,142 @@ function App() {
         </main>
       )}
     </div>
+  );
+}
+
+// ============================================================
+// Observability dashboard
+// ============================================================
+
+function formatNumber(value, digits = 0) {
+  const number = Number(value ?? 0);
+  return Number.isFinite(number)
+    ? number.toLocaleString(undefined, { maximumFractionDigits: digits })
+    : "0";
+}
+
+function ObservabilityPage({ data, loading, error, onRefresh, onBack }) {
+  const http = data?.http || {};
+  const workflows = data?.workflows || {};
+
+  return (
+    <main className="admin-page observability-page">
+      <div className="admin-heading">
+        <div>
+          <p className="eyebrow">SYSTEM HEALTH</p>
+          <h2>Observability Dashboard</h2>
+          <p>
+            Persistent API and scheduling-workflow metrics collected by the backend.
+            Metrics exclude request bodies, patient names, and conversation IDs.
+          </p>
+          {data?.generated_at && (
+            <p className="observability-generated">
+              Last refreshed: {new Date(data.generated_at).toLocaleString()}
+            </p>
+          )}
+        </div>
+        <div className="admin-heading-actions">
+          <button type="button" className="secondary-button" onClick={onRefresh} disabled={loading}>
+            <RefreshCw size={16} />
+            {loading ? "Refreshing..." : "Refresh metrics"}
+          </button>
+          <button type="button" className="secondary-button" onClick={onBack}>
+            Doctor Management
+          </button>
+        </div>
+      </div>
+
+      {error && (
+        <div className="feedback error-feedback" role="alert">
+          <strong>Could not load observability data</strong>
+          <pre>{error}</pre>
+        </div>
+      )}
+
+      {loading && !data ? (
+        <div className="admin-card"><p>Loading observability metrics...</p></div>
+      ) : (
+        <>
+          <section className="summary-grid observability-summary-grid">
+            <SummaryCard icon={<Activity size={21} />} label="HTTP requests" value={formatNumber(http.total_requests)} />
+            <SummaryCard icon={<ShieldCheck size={21} />} label="Failed HTTP requests" value={formatNumber(http.failed_requests)} />
+            <SummaryCard icon={<Clock size={21} />} label="Average API latency" value={`${formatNumber(http.avg_latency_ms, 2)} ms`} />
+            <SummaryCard icon={<Bot size={21} />} label="Scheduling workflows" value={formatNumber(workflows.total)} />
+            <SummaryCard icon={<CheckCircle2 size={21} />} label="Booking completions" value={formatNumber(workflows.completed)} />
+            <SummaryCard icon={<Clock size={21} />} label="Average workflow duration" value={`${formatNumber(workflows.avg_duration_ms, 2)} ms`} />
+          </section>
+
+          <section className="admin-card">
+            <div className="admin-card-heading">
+              <div className="admin-card-icon"><Activity size={21} /></div>
+              <div><h3>API routes</h3><p>Request volume, average latency, and failures by route</p></div>
+            </div>
+            {http.routes?.length ? (
+              <div className="doctor-table-wrap">
+                <table className="doctor-table observability-table">
+                  <thead><tr><th>Method</th><th>Route</th><th>Requests</th><th>Avg latency</th><th>Failures</th></tr></thead>
+                  <tbody>{http.routes.map((route, index) => (
+                    <tr key={`${route.method}-${route.path}-${index}`}>
+                      <td><span className="method-pill">{route.method}</span></td>
+                      <td><code>{route.path}</code></td>
+                      <td>{formatNumber(route.requests)}</td>
+                      <td>{formatNumber(route.avg_latency_ms, 2)} ms</td>
+                      <td>{formatNumber(route.failures)}</td>
+                    </tr>
+                  ))}</tbody>
+                </table>
+              </div>
+            ) : <div className="empty-directory"><Activity size={28} /><strong>No API metrics yet</strong><p>Requests will appear here after the metrics store is initialized and traffic reaches the API.</p></div>}
+          </section>
+
+          <section className="admin-card">
+            <div className="admin-card-heading">
+              <div className="admin-card-icon"><Bot size={21} /></div>
+              <div><h3>Recent scheduling workflows</h3><p>Latest workflow outcomes and execution duration</p></div>
+            </div>
+            {workflows.recent?.length ? (
+              <div className="doctor-table-wrap">
+                <table className="doctor-table observability-table">
+                  <thead><tr><th>Time (UTC)</th><th>Status</th><th>Outcome</th><th>Duration</th><th>Trace nodes</th></tr></thead>
+                  <tbody>{workflows.recent.map((item, index) => (
+                    <tr key={`${item.created_at}-${index}`}>
+                      <td>{item.created_at ? new Date(item.created_at).toLocaleString() : "—"}</td>
+                      <td>{item.workflow_status || "—"}</td>
+                      <td><span className={`outcome-pill ${item.outcome === "booking_completed" ? "outcome-success" : item.outcome === "failure" ? "outcome-failure" : ""}`}>{item.outcome || "—"}</span></td>
+                      <td>{formatNumber(item.duration_ms, 2)} ms</td>
+                      <td>{formatNumber(item.trace_node_count)}</td>
+                    </tr>
+                  ))}</tbody>
+                </table>
+              </div>
+            ) : <div className="empty-directory"><Bot size={28} /><strong>No workflow metrics yet</strong><p>Send a scheduling request to start collecting workflow metrics.</p></div>}
+          </section>
+
+          <section className="admin-card">
+            <div className="admin-card-heading">
+              <div className="admin-card-icon"><Clock size={21} /></div>
+              <div><h3>Recent HTTP requests</h3><p>Latest API request outcomes</p></div>
+            </div>
+            {http.recent?.length ? (
+              <div className="doctor-table-wrap">
+                <table className="doctor-table observability-table">
+                  <thead><tr><th>Time (UTC)</th><th>Method</th><th>Route</th><th>Status</th><th>Duration</th></tr></thead>
+                  <tbody>{http.recent.map((item, index) => (
+                    <tr key={`${item.created_at}-${index}`}>
+                      <td>{item.created_at ? new Date(item.created_at).toLocaleString() : "—"}</td>
+                      <td><span className="method-pill">{item.method}</span></td>
+                      <td><code>{item.path}</code></td>
+                      <td><span className={`outcome-pill ${item.status_code < 400 ? "outcome-success" : "outcome-failure"}`}>{item.status_code}</span></td>
+                      <td>{formatNumber(item.duration_ms, 2)} ms</td>
+                    </tr>
+                  ))}</tbody>
+                </table>
+              </div>
+            ) : <div className="empty-directory"><Clock size={28} /><strong>No HTTP metrics yet</strong><p>API request history will appear here as requests are recorded.</p></div>}
+          </section>
+        </>
+      )}
+    </main>
   );
 }
 
