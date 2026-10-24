@@ -1,12 +1,10 @@
-# CareFlow AI --- Agent-Based Healthcare Scheduling System
+# CareFlow AI - Agent-Based Healthcare Scheduling System
 
 CareFlow AI is an agent-based healthcare appointment scheduling
 application. It combines a React/Vite frontend with a FastAPI backend
 and a LangGraph workflow to guide users through appointment scheduling,
 collect missing details across turns, and return structured responses.
 
-> **Deployment note:** Replace URL placeholders with the actual URLs
-> assigned by Render. Report test results only from the latest test run.
 
 ## Contents
 
@@ -185,11 +183,10 @@ exposed to browser code.
 ### 1. Clone the repository
 
 ``` bash
-git clone <YOUR_GITHUB_REPOSITORY_URL>
-cd Agent-Based-Scheduling-System-Healthcare-Operations
+git clone https://github.com/shaadclt/CareFlow-AI-Agent-Based-Healthcare-Scheduling-System
+cd CareFlow-AI-Agent-Based-Healthcare-Scheduling-System
 ```
 
-Replace the placeholder with the actual repository URL.
 
 ### 2. Install and run the backend
 
@@ -416,26 +413,6 @@ Persistence after container restart.
 
 ## Troubleshooting
 
-### Backend container is unhealthy
-
-``` powershell
-docker compose logs --tail=150 backend
-```
-
-Fix the first startup traceback. If a dependency is missing, add the
-package to the requirements file used by the Docker build, then rebuild
-the backend image.
-
-### `python-multipart` is missing
-
-Add `python-multipart` to the backend requirements file used by Docker
-and rebuild the image.
-
-### `langgraph.checkpoint.sqlite` cannot be imported
-
-Ensure `langgraph-checkpoint-sqlite` is installed in the backend image
-and compatible with the installed LangGraph dependencies.
-
 ### Browser reports a CORS error
 
 -   Check `FRONTEND_URL` on the backend service.
@@ -479,14 +456,8 @@ and concurrency handling. - Structured logging and observability. -
 CI/CD and deployment checks. - Accessibility and responsive UI
 improvements.
 
-## License
-
-Add a license before redistributing the project or accepting external
-contributions. Until a license is included, all rights remain with the
-copyright holder.
-
 ## Author
 
 **Mohamed Shaad**
 
-CareFlow AI --- Agent-Based Scheduling System for Healthcare Operations.
+CareFlow AI - Agent-Based Scheduling System for Healthcare Operations.
