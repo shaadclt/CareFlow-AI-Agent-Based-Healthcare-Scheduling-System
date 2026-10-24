@@ -1443,3 +1443,79 @@ button {
     flex-wrap: wrap;
   }
 }
+
+
+/* ============================================================
+   Observability dashboard
+   ============================================================ */
+
+.observability-page .observability-generated {
+  margin-top: 10px;
+  font-size: 11px;
+  color: #94a3b8;
+}
+
+.observability-summary-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.observability-table code {
+  display: inline-block;
+  max-width: 360px;
+  color: #334155;
+  font-size: 11px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.method-pill,
+.outcome-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: #eef2ff;
+  color: #3730a3;
+  font-size: 10px;
+  font-weight: 750;
+  white-space: nowrap;
+}
+
+.outcome-success {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.outcome-failure {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+@media (max-width: 950px) {
+  .observability-summary-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .observability-table code {
+    max-width: 220px;
+  }
+}
+
+@media (max-width: 600px) {
+  .observability-summary-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .observability-page .admin-heading-actions {
+    width: 100%;
+  }
+
+  .observability-page .admin-heading-actions button {
+    flex: 1;
+  }
+
+  .observability-table {
+    min-width: 680px;
+  }
+}
