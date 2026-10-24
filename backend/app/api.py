@@ -1,16 +1,24 @@
-"""FastAPI application for healthcare appointment scheduling."""
-
 from contextlib import asynccontextmanager
 from typing import Any
 import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import secrets
 import time
+from time import perf_counter
 
-from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Header,
+    HTTPException,
+    Request,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -23,6 +31,31 @@ from backend.app.doctor_import import (
     list_doctors,
     validate_doctors_json,
 )
+
+
+# ============================================================
+# Observability / Logging
+# ============================================================
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(message)s",
+)
+
+logger = logging.getLogger("careflow")
+
+
+def log_event(event: str, **fields: Any) -> None:
+    """Write a structured JSON log without sensitive request content."""
+    record = {
+        "event": event,
+        "timestamp": time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ",
+            time.gmtime(),
+        ),
+        **fields,
+    }
+    logger.info(json.dumps(record, default=str))
 
 
 # ============================================================
@@ -42,37 +75,74 @@ def _admin_secret() -> str:
     if len(secret) < 32:
         raise HTTPException(
             status_code=503,
-            detail="Admin authentication is not configured securely. Set ADMIN_SECRET_KEY to a random value of at least 32 characters.",
+            detail=(
+                "Admin authentication is not configured securely. "
+                "Set ADMIN_SECRET_KEY to a random value of at least "
+                "32 characters."
+            ),
         )
     return secret
 
 
 def _encode_token(payload: dict[str, Any]) -> str:
-    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
-    encoded = base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+    raw = json.dumps(
+        payload,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+
+    encoded = (
+        base64.urlsafe_b64encode(raw)
+        .rstrip(b"=")
+        .decode()
+    )
+
     signature = hmac.new(
-        _admin_secret().encode(), encoded.encode(), hashlib.sha256
+        _admin_secret().encode(),
+        encoded.encode(),
+        hashlib.sha256,
     ).digest()
-    signature_encoded = base64.urlsafe_b64encode(signature).rstrip(b"=").decode()
+
+    signature_encoded = (
+        base64.urlsafe_b64encode(signature)
+        .rstrip(b"=")
+        .decode()
+    )
+
     return f"{encoded}.{signature_encoded}"
 
 
 def _decode_token(token: str) -> dict[str, Any]:
     try:
         encoded, signature = token.split(".", 1)
+
         expected = hmac.new(
-            _admin_secret().encode(), encoded.encode(), hashlib.sha256
+            _admin_secret().encode(),
+            encoded.encode(),
+            hashlib.sha256,
         ).digest()
+
         supplied = base64.urlsafe_b64decode(
             signature + "=" * (-len(signature) % 4)
         )
+
         if not hmac.compare_digest(expected, supplied):
             raise ValueError("Invalid signature")
-        raw = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+
+        raw = base64.urlsafe_b64decode(
+            encoded + "=" * (-len(encoded) % 4)
+        )
+
         payload = json.loads(raw)
-        if payload.get("role") != "admin" or int(payload.get("exp", 0)) < int(time.time()):
-            raise ValueError("Expired token")
+
+        if (
+            payload.get("role") != "admin"
+            or int(payload.get("exp", 0)) < int(time.time())
+        ):
+            raise ValueError("Expired or invalid token")
+
         return payload
+
     except Exception as exc:
         raise HTTPException(
             status_code=401,
@@ -81,13 +151,16 @@ def _decode_token(token: str) -> dict[str, Any]:
         ) from exc
 
 
-async def require_admin(authorization: str | None = Header(default=None)):
+async def require_admin(
+    authorization: str | None = Header(default=None),
+):
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(
             status_code=401,
             detail="Admin login is required.",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
     return _decode_token(authorization[7:].strip())
 
 
@@ -106,7 +179,11 @@ graph = build_graph()
 async def lifespan(app: FastAPI):
     """Initialize application resources on startup."""
     init_db()
-    yield
+    log_event("application_started")
+    try:
+        yield
+    finally:
+        log_event("application_stopped")
 
 
 # ============================================================
@@ -135,6 +212,51 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ============================================================
+# HTTP Request Observability Middleware
+# ============================================================
+
+@app.middleware("http")
+async def log_http_requests(
+    request: Request,
+    call_next,
+):
+    """Measure API latency and log the HTTP outcome."""
+    start_time = perf_counter()
+    status_code = 500
+
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+
+    except Exception:
+        log_event(
+            "http_request_exception",
+            method=request.method,
+            path=request.url.path,
+        )
+        logger.exception("Unhandled HTTP request exception")
+        raise
+
+    finally:
+        duration_ms = round(
+            (perf_counter() - start_time) * 1000,
+            2,
+        )
+
+        log_event(
+            "http_request",
+            method=request.method,
+            path=request.url.path,
+            status_code=status_code,
+            duration_ms=duration_ms,
+            outcome=(
+                "success" if status_code < 400 else "failure"
+            ),
+        )
 
 
 # ============================================================
@@ -215,7 +337,7 @@ async def health():
 
 
 # ============================================================
-# Schedule Appointment
+# Schedule Appointment + Workflow Observability
 # ============================================================
 
 @app.post(
@@ -223,6 +345,8 @@ async def health():
     response_model=SchedulingResponse,
 )
 async def schedule(request: SchedulingRequest):
+    start_time = perf_counter()
+
     try:
         config = {
             "configurable": {
@@ -235,22 +359,69 @@ async def schedule(request: SchedulingRequest):
             config=config,
         )
 
+        status = str(result.get("status", ""))
+        trace = result.get("trace", [])
+
+        if not isinstance(trace, list):
+            trace = []
+
+        duration_ms = round(
+            (perf_counter() - start_time) * 1000,
+            2,
+        )
+
+        executed_nodes = [
+            item.get("node", "unknown")
+            for item in trace
+            if isinstance(item, dict)
+        ]
+
+        # This label is based on the graph's returned status.
+        # Verify "booking_completed" against graph.py.
+        outcome = (
+            "booking_completed"
+            if status == "booking_completed"
+            else "incomplete_or_other"
+        )
+
+        log_event(
+            "scheduling_workflow",
+            outcome=outcome,
+            workflow_status=status,
+            duration_ms=duration_ms,
+            trace_node_count=len(trace),
+            executed_nodes=executed_nodes,
+        )
+
         return SchedulingResponse(
             thread_id=request.thread_id,
             response=result.get("response", ""),
-            status=result.get("status", ""),
-            trace=result.get("trace", []),
+            status=status,
+            trace=trace,
         )
 
-    except Exception as exc:
-        # Keep internal exception details out of the API response.
+    except HTTPException:
+        raise
+
+    except Exception:
+        duration_ms = round(
+            (perf_counter() - start_time) * 1000,
+            2,
+        )
+
+        log_event(
+            "scheduling_workflow_failed",
+            duration_ms=duration_ms,
+        )
+        logger.exception("Scheduling workflow failed")
+
         raise HTTPException(
             status_code=500,
             detail=(
                 "An error occurred while processing "
                 "the scheduling request."
             ),
-        ) from exc
+        ) from None
 
 
 # ============================================================
@@ -284,15 +455,24 @@ async def get_conversation_state(thread_id: str):
             available_slots=values.get("available_slots", []),
         )
 
-    except Exception as exc:
+    except Exception:
+        logger.exception("Unable to retrieve conversation state")
         raise HTTPException(
             status_code=500,
             detail="Unable to retrieve conversation state.",
-        ) from exc
+        ) from None
 
+
+# ============================================================
+# Debug Conversation (Admin Only)
+# ============================================================
 
 @app.get("/api/v1/conversations/{thread_id}/debug")
-async def debug_conversation(thread_id: str):
+async def debug_conversation(
+    thread_id: str,
+    admin=Depends(require_admin),
+):
+    """Return full graph state only to authenticated administrators."""
     try:
         config = {
             "configurable": {
@@ -302,16 +482,22 @@ async def debug_conversation(thread_id: str):
 
         snapshot = graph.get_state(config)
 
+        log_event("conversation_debug_access")
+
         return {
             "thread_id": thread_id,
             "state": snapshot.values,
         }
 
-    except Exception as exc:
+    except HTTPException:
+        raise
+
+    except Exception:
+        logger.exception("Unable to retrieve conversation debug state")
         raise HTTPException(
             status_code=500,
             detail="Unable to retrieve conversation debug state.",
-        ) from exc
+        ) from None
 
 
 # ============================================================
@@ -322,28 +508,59 @@ async def debug_conversation(thread_id: str):
 async def admin_login(request: AdminLoginRequest):
     username = os.getenv("ADMIN_USERNAME", "")
     password = os.getenv("ADMIN_PASSWORD", "")
+
     if not username or not password:
         raise HTTPException(
             status_code=503,
-            detail="Admin credentials are not configured. Set ADMIN_USERNAME and ADMIN_PASSWORD in the backend environment.",
+            detail=(
+                "Admin credentials are not configured. "
+                "Set ADMIN_USERNAME and ADMIN_PASSWORD "
+                "in the backend environment."
+            ),
         )
-    username_ok = secrets.compare_digest(request.username, username)
-    password_ok = secrets.compare_digest(request.password, password)
-    if not (username_ok and password_ok):
-        # Keep the response generic to avoid revealing which field was incorrect.
-        raise HTTPException(status_code=401, detail="Invalid username or password.")
-    now = int(time.time())
-    token = _encode_token(
-        {"sub": username, "role": "admin", "iat": now,
-         "exp": now + ADMIN_TOKEN_TTL_SECONDS}
+
+    username_ok = secrets.compare_digest(
+        request.username,
+        username,
     )
-    return {"access_token": token, "token_type": "bearer",
-            "expires_in": ADMIN_TOKEN_TTL_SECONDS}
+    password_ok = secrets.compare_digest(
+        request.password,
+        password,
+    )
+
+    if not (username_ok and password_ok):
+        log_event("admin_login_failed")
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid username or password.",
+        )
+
+    now = int(time.time())
+
+    token = _encode_token(
+        {
+            "sub": username,
+            "role": "admin",
+            "iat": now,
+            "exp": now + ADMIN_TOKEN_TTL_SECONDS,
+        }
+    )
+
+    log_event("admin_login_succeeded")
+
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_in": ADMIN_TOKEN_TTL_SECONDS,
+    }
 
 
 @app.get("/api/v1/admin/session")
 async def admin_session(admin=Depends(require_admin)):
-    return {"authenticated": True, "username": admin.get("sub", "admin")}
+    return {
+        "authenticated": True,
+        "username": admin.get("sub", "admin"),
+    }
 
 
 # ============================================================
@@ -396,12 +613,21 @@ async def _read_and_validate_doctor_file(
 # ============================================================
 
 @app.post("/api/v1/admin/doctors/preview")
-async def preview_doctors(file: UploadFile = File(...), admin=Depends(require_admin)):
+async def preview_doctors(
+    file: UploadFile = File(...),
+    admin=Depends(require_admin),
+):
     result = await _read_and_validate_doctor_file(file)
     doctors = result["doctors"]
 
     specialties = sorted(
         {doctor["specialty"] for doctor in doctors}
+    )
+
+    log_event(
+        "doctor_import_preview",
+        doctor_count=len(doctors),
+        specialty_count=len(specialties),
     )
 
     return {
@@ -420,27 +646,37 @@ async def preview_doctors(file: UploadFile = File(...), admin=Depends(require_ad
 # ============================================================
 
 @app.post("/api/v1/admin/doctors/initialize")
-async def initialize_doctors(file: UploadFile = File(...), admin=Depends(require_admin)):
+async def initialize_doctors(
+    file: UploadFile = File(...),
+    admin=Depends(require_admin),
+):
     result = await _read_and_validate_doctor_file(file)
 
     try:
         import_result = import_doctors(result["doctors"])
         current_doctors = list_doctors()
 
-    except Exception as exc:
+    except Exception:
+        logger.exception("Doctor directory import failed")
         raise HTTPException(
             status_code=500,
             detail=(
                 "Doctor import failed. "
                 "The database transaction was rolled back."
             ),
-        ) from exc
+        ) from None
 
     specialties = {
         doctor["specialty"]
         for doctor in current_doctors
         if doctor.get("specialty")
     }
+
+    log_event(
+        "doctor_directory_initialized",
+        total_doctors=len(current_doctors),
+        total_specialties=len(specialties),
+    )
 
     return {
         "message": "Doctor directory initialized successfully.",
@@ -483,40 +719,62 @@ async def get_doctor_summary(admin=Depends(require_admin)):
         "total_specialties": len(specialties),
     }
 
+
 # ============================================================
 # Admin: Reset Doctor Directory
 # ============================================================
 
 @app.post("/api/v1/admin/doctors/reset")
 async def reset_doctor_directory(admin=Depends(require_admin)):
-    """Delete all doctors, their availability, and linked appointments.
+    """Delete doctors, availability and linked appointments.
 
     This destructive operation is restricted to authenticated admins.
     Patient records are retained.
     """
     db = SessionLocal()
+
     try:
         appointments_deleted = db.query(Appointment).delete(
             synchronize_session=False
         )
-        availability_deleted = db.query(DoctorAvailability).delete(
+
+        availability_deleted = db.query(
+            DoctorAvailability
+        ).delete(
             synchronize_session=False
         )
+
         doctors_deleted = db.query(Doctor).delete(
             synchronize_session=False
         )
+
         db.commit()
+
+        log_event(
+            "doctor_directory_reset",
+            doctors_deleted=doctors_deleted,
+            availability_slots_deleted=availability_deleted,
+            appointments_deleted=appointments_deleted,
+        )
+
         return {
             "message": "Doctor directory reset successfully.",
             "doctors_deleted": doctors_deleted,
             "availability_slots_deleted": availability_deleted,
             "appointments_deleted": appointments_deleted,
         }
-    except Exception as exc:
+
+    except Exception:
         db.rollback()
+        logger.exception("Doctor directory reset failed")
+
         raise HTTPException(
             status_code=500,
-            detail="Could not reset the doctor directory. No changes were committed.",
-        ) from exc
+            detail=(
+                "Could not reset the doctor directory. "
+                "No changes were committed."
+            ),
+        ) from None
+
     finally:
         db.close()
