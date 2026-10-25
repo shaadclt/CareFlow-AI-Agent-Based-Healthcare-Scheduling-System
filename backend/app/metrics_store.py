@@ -1,209 +1,221 @@
+
+"""Persistent SQLite metrics store for CareFlow AI."""
+from __future__ import annotations
+
+import os
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-BACKEND_DIR = Path(__file__).resolve().parents[1]
-DATA_DIR = BACKEND_DIR / "data"
-METRICS_DB = DATA_DIR / "observability.db"
+
+def _db_path() -> Path:
+    configured = os.getenv("OBSERVABILITY_DB_PATH")
+    if configured:
+        path = Path(configured)
+    else:
+        path = (
+            Path(__file__).resolve().parent.parent
+            / "data"
+            / "observability.db"
+        )
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
 
 
-def _connect():
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-    connection = sqlite3.connect(
-        METRICS_DB,
-        timeout=10,
-    )
+def _connect() -> sqlite3.Connection:
+    connection = sqlite3.connect(str(_db_path()), timeout=10)
     connection.row_factory = sqlite3.Row
     return connection
 
 
 def init_metrics_db() -> None:
-    """Create the observability database and its tables."""
-    with _connect() as connection:
-        connection.executescript(
-            """
+    with _connect() as conn:
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS http_metrics (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                created_at TEXT NOT NULL DEFAULT (
-                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                ),
+                created_at TEXT NOT NULL DEFAULT
+                    (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
                 method TEXT NOT NULL,
-                route TEXT NOT NULL,
+                path TEXT NOT NULL,
                 status_code INTEGER NOT NULL,
-                duration_ms REAL NOT NULL
-            );
+                duration_ms REAL NOT NULL,
+                outcome TEXT NOT NULL
+            )
+        """)
 
-            CREATE INDEX IF NOT EXISTS idx_http_metrics_created
-            ON http_metrics(created_at);
-
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS workflow_metrics (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                created_at TEXT NOT NULL DEFAULT (
-                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                ),
-                outcome TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT
+                    (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
                 workflow_status TEXT NOT NULL,
+                outcome TEXT NOT NULL,
                 duration_ms REAL NOT NULL,
                 trace_node_count INTEGER NOT NULL DEFAULT 0
-            );
+            )
+        """)
 
-            CREATE INDEX IF NOT EXISTS idx_workflow_metrics_created
-            ON workflow_metrics(created_at);
-            """
-        )
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_http_created
+            ON http_metrics(created_at)
+        """)
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_workflow_created
+            ON workflow_metrics(created_at)
+        """)
 
 
 def record_http_metric(
+    *,
     method: str,
-    route: str,
+    path: str,
     status_code: int,
     duration_ms: float,
+    outcome: str,
 ) -> None:
-    """Persist one HTTP request measurement."""
-    with _connect() as connection:
-        connection.execute(
+    """Record one HTTP request. Does not store query strings or request bodies."""
+    with _connect() as conn:
+        conn.execute(
             """
-            INSERT INTO http_metrics (
-                method,
-                route,
-                status_code,
-                duration_ms
-            )
-            VALUES (?, ?, ?, ?)
+            INSERT INTO http_metrics
+                (method, path, status_code, duration_ms, outcome)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (method, route, status_code, duration_ms),
+            (
+                method,
+                path,
+                int(status_code),
+                float(duration_ms),
+                outcome,
+            ),
         )
 
 
 def record_workflow_metric(
-    outcome: str,
+    *,
     workflow_status: str,
+    outcome: str,
     duration_ms: float,
     trace_node_count: int,
 ) -> None:
-    """Persist one scheduling workflow measurement."""
-    with _connect() as connection:
-        connection.execute(
+    """Record one scheduling workflow execution."""
+    with _connect() as conn:
+        conn.execute(
             """
-            INSERT INTO workflow_metrics (
-                outcome,
-                workflow_status,
-                duration_ms,
-                trace_node_count
-            )
+            INSERT INTO workflow_metrics
+                (workflow_status, outcome, duration_ms, trace_node_count)
             VALUES (?, ?, ?, ?)
             """,
             (
-                outcome,
                 workflow_status,
-                duration_ms,
-                trace_node_count,
+                outcome,
+                float(duration_ms),
+                int(trace_node_count),
             ),
         )
 
 
 def get_metrics_summary() -> dict[str, Any]:
-    """Return aggregated counts and latency statistics."""
-    with _connect() as connection:
-        http = connection.execute(
-            """
+    """Return aggregate and recent metrics for the admin dashboard."""
+    with _connect() as conn:
+        http = conn.execute("""
             SELECT
                 COUNT(*) AS total_requests,
-                COALESCE(
-                    AVG(duration_ms), 0
-                ) AS average_latency_ms,
-                COALESCE(
-                    MAX(duration_ms), 0
-                ) AS max_latency_ms,
-                COALESCE(
-                    SUM(CASE WHEN status_code >= 400
-                        THEN 1 ELSE 0 END), 0
-                ) AS error_requests,
-                COALESCE(
-                    SUM(CASE WHEN status_code >= 500
-                        THEN 1 ELSE 0 END), 0
-                ) AS server_errors
+                SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END)
+                    AS failed_requests,
+                AVG(duration_ms) AS avg_latency_ms,
+                MAX(duration_ms) AS max_latency_ms
             FROM http_metrics
-            """
-        ).fetchone()
+        """).fetchone()
 
-        workflows = connection.execute(
-            """
+        statuses = conn.execute("""
+            SELECT status_code, COUNT(*) AS count
+            FROM http_metrics
+            GROUP BY status_code
+            ORDER BY status_code
+        """).fetchall()
+
+        routes = conn.execute("""
+            SELECT
+                method,
+                path,
+                COUNT(*) AS requests,
+                AVG(duration_ms) AS avg_latency_ms,
+                SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END)
+                    AS failures
+            FROM http_metrics
+            GROUP BY method, path
+            ORDER BY requests DESC
+            LIMIT 20
+        """).fetchall()
+
+        workflow = conn.execute("""
             SELECT
                 COUNT(*) AS total_workflows,
-                COALESCE(
-                    AVG(duration_ms), 0
-                ) AS average_workflow_latency_ms,
-                COALESCE(
-                    SUM(CASE WHEN outcome = 'booking_completed'
-                        THEN 1 ELSE 0 END), 0
-                ) AS completed_bookings,
-                COALESCE(
-                    SUM(CASE WHEN outcome = 'failure'
-                        THEN 1 ELSE 0 END), 0
-                ) AS failed_workflows,
-                COALESCE(
-                    SUM(CASE WHEN outcome = 'incomplete_or_other'
-                        THEN 1 ELSE 0 END), 0
-                ) AS incomplete_workflows
+                SUM(CASE WHEN outcome = 'booking_completed' THEN 1 ELSE 0 END)
+                    AS completed,
+                SUM(CASE WHEN outcome = 'failure' THEN 1 ELSE 0 END)
+                    AS failed,
+                AVG(duration_ms) AS avg_duration_ms,
+                AVG(trace_node_count) AS avg_trace_nodes
             FROM workflow_metrics
-            """
-        ).fetchone()
+        """).fetchone()
 
-        recent_requests = connection.execute(
-            """
-            SELECT
-                created_at,
-                method,
-                route,
-                status_code,
-                duration_ms
+        workflow_statuses = conn.execute("""
+            SELECT workflow_status, outcome, COUNT(*) AS count
+            FROM workflow_metrics
+            GROUP BY workflow_status, outcome
+            ORDER BY count DESC
+        """).fetchall()
+
+        recent_http = conn.execute("""
+            SELECT created_at, method, path, status_code,
+                   duration_ms, outcome
             FROM http_metrics
             ORDER BY id DESC
-            LIMIT 15
-            """
-        ).fetchall()
+            LIMIT 20
+        """).fetchall()
 
-        recent_workflows = connection.execute(
-            """
-            SELECT
-                created_at,
-                outcome,
-                workflow_status,
-                duration_ms,
-                trace_node_count
+        recent_workflows = conn.execute("""
+            SELECT created_at, workflow_status, outcome,
+                   duration_ms, trace_node_count
             FROM workflow_metrics
             ORDER BY id DESC
-            LIMIT 10
-            """
-        ).fetchall()
+            LIMIT 20
+        """).fetchall()
+
+    def rows(items):
+        return [dict(item) for item in items]
 
     return {
-        "requests": {
-            "total": http["total_requests"],
-            "average_latency_ms": round(
-                http["average_latency_ms"], 2
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "http": {
+            "total_requests": int(http["total_requests"] or 0),
+            "failed_requests": int(http["failed_requests"] or 0),
+            "avg_latency_ms": round(
+                float(http["avg_latency_ms"] or 0), 2
             ),
             "max_latency_ms": round(
-                http["max_latency_ms"], 2
+                float(http["max_latency_ms"] or 0), 2
             ),
-            "error_count": http["error_requests"],
-            "server_error_count": http["server_errors"],
+            "status_breakdown": rows(statuses),
+            "routes": rows(routes),
+            "recent": rows(recent_http),
         },
         "workflows": {
-            "total": workflows["total_workflows"],
-            "average_latency_ms": round(
-                workflows["average_workflow_latency_ms"], 2
+            "total": int(workflow["total_workflows"] or 0),
+            "completed": int(workflow["completed"] or 0),
+            "failed": int(workflow["failed"] or 0),
+            "avg_duration_ms": round(
+                float(workflow["avg_duration_ms"] or 0), 2
             ),
-            "completed_bookings": workflows["completed_bookings"],
-            "failed": workflows["failed_workflows"],
-            "incomplete_or_other": workflows["incomplete_workflows"],
+            "avg_trace_nodes": round(
+                float(workflow["avg_trace_nodes"] or 0), 2
+            ),
+            "status_breakdown": rows(workflow_statuses),
+            "recent": rows(recent_workflows),
         },
-        "recent_requests": [
-            dict(row) for row in recent_requests
-        ],
-        "recent_workflows": [
-            dict(row) for row in recent_workflows
-        ],
     }
